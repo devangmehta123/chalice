@@ -2,6 +2,44 @@
 CHANGELOG
 =========
 
+1.16.0
+======
+
+* enhancement:local:Avoid error from cognito client credentials in local authorizer (#1447)
+* bugfix:package:Traverse symlinks to directories when packaging the vendor directory (#583).
+* feature:DomainName:Add support for custom domain names to REST/WebSocket APIs (#1194)
+* feature:auth:Add support for oauth scopes on routes (#1444).
+
+
+1.15.1
+======
+
+* bugfix:packaging:Fix setup.py dependencies where the wheel package was not being installed (#1435)
+
+
+1.15.0
+======
+
+* feature:blueprints:Mark blueprints as an accepted API (#1250)
+* feature:package:Add ability to generate and merge yaml CloudFormation templates (#1425)
+* enhancement:terraform:Allow generated terraform template to be used as a terraform module (#1300)
+* feature:logs:Add support for tailing logs (#4).
+
+
+1.14.1
+======
+
+* enhancement:pip:Update pip version range to 20.1.
+
+
+1.14.0
+======
+
+* bugfix:packaging:Fix pandas packaging regression (#1398)
+* feature:CLI:Add ``dev plan/appgraph`` commands (#1396)
+* enhancement:SQS:Validate queue name is used and not queue URL or ARN (#1388)
+
+
 1.13.1
 ======
 

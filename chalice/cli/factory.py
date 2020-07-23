@@ -8,7 +8,7 @@ import functools
 import click
 from botocore.config import Config as BotocoreConfig
 from botocore.session import Session
-from typing import Any, Optional, Dict, MutableMapping  # noqa
+from typing import Any, Optional, Dict, MutableMapping, cast  # noqa
 
 from chalice import __version__ as chalice_version
 from chalice.awsclient import TypedAWSClient
@@ -20,7 +20,9 @@ from chalice.package import AppPackager  # noqa
 from chalice.constants import DEFAULT_STAGE_NAME
 from chalice.constants import DEFAULT_APIGATEWAY_STAGE_NAME
 from chalice.constants import DEFAULT_ENDPOINT_TYPE
-from chalice.logs import LogRetriever
+from chalice.logs import LogRetriever, LogEventGenerator
+from chalice.logs import FollowLogEventGenerator
+from chalice.logs import BaseLogEventGenerator
 from chalice import local
 from chalice.utils import UI  # noqa
 from chalice.utils import PipeReader  # noqa
@@ -183,15 +185,24 @@ class CLIFactory(object):
         except ValueError:
             raise UnknownConfigFileVersion(string_version)
 
-    def create_app_packager(self, config, package_format, merge_template=None):
-        # type: (Config, str, OptStr) -> AppPackager
+    def create_app_packager(self, config, package_format, template_format,
+                            merge_template=None):
+        # type: (Config, str, str, OptStr) -> AppPackager
         return create_app_packager(
-            config, package_format, merge_template=merge_template)
+            config, package_format, template_format,
+            merge_template=merge_template)
 
-    def create_log_retriever(self, session, lambda_arn):
-        # type: (Session, str) -> LogRetriever
+    def create_log_retriever(self, session, lambda_arn, follow_logs):
+        # type: (Session, str, bool) -> LogRetriever
         client = TypedAWSClient(session)
-        retriever = LogRetriever.create_from_lambda_arn(client, lambda_arn)
+        if follow_logs:
+            event_generator = cast(BaseLogEventGenerator,
+                                   FollowLogEventGenerator(client))
+        else:
+            event_generator = cast(BaseLogEventGenerator,
+                                   LogEventGenerator(client))
+        retriever = LogRetriever.create_from_lambda_arn(event_generator,
+                                                        lambda_arn)
         return retriever
 
     def create_stdin_reader(self):

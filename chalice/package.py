@@ -4,12 +4,18 @@ import copy
 import json
 import os
 
+import six
 from typing import Any, Optional, Dict, List, Set, Union  # noqa
 from typing import cast
+import yaml
+from yaml.scanner import ScannerError
+from yaml.nodes import Node, ScalarNode, SequenceNode
 
 from chalice.deploy.swagger import (
     CFNSwaggerGenerator, TerraformSwaggerGenerator)
-from chalice.utils import OSUtils, UI, serialize_to_json, to_cfn_resource_name
+from chalice.utils import (
+    OSUtils, UI, serialize_to_json, to_cfn_resource_name
+)
 from chalice.config import Config  # noqa
 from chalice.deploy import models
 from chalice.deploy.appgraph import ApplicationGraphBuilder, DependencyBuilder
@@ -18,8 +24,9 @@ from chalice.deploy.deployer import create_build_stage
 
 
 def create_app_packager(
-        config, package_format='cloudformation', merge_template=None):
-    # type: (Config, str, Optional[str]) -> AppPackager
+        config, package_format='cloudformation',
+        template_format='json', merge_template=None):
+    # type: (Config, str, str, Optional[str]) -> AppPackager
     osutils = OSUtils()
     ui = UI()
     application_builder = ApplicationGraphBuilder()
@@ -27,14 +34,25 @@ def create_app_packager(
     post_processors = []  # type: List[TemplatePostProcessor]
     generator = None  # type: Union[None, TemplateGenerator]
 
+    template_serializer = cast(TemplateSerializer, JSONTemplateSerializer())
     if package_format == 'cloudformation':
         build_stage = create_build_stage(
             osutils, ui, CFNSwaggerGenerator())
+        use_yaml_serializer = template_format == 'yaml'
+        if merge_template is not None and \
+                YAMLTemplateSerializer.is_yaml_template(merge_template):
+            # Automatically switch the serializer to yaml if they specify
+            # a yaml template to merge, regardless of what template format
+            # they specify.
+            use_yaml_serializer = True
+        if use_yaml_serializer:
+            template_serializer = YAMLTemplateSerializer()
         post_processors.extend([
             SAMCodeLocationPostProcessor(osutils=osutils),
             TemplateMergePostProcessor(
                 osutils=osutils,
                 merger=TemplateDeepMerger(),
+                template_serializer=template_serializer,
                 merge_template=merge_template)])
         generator = SAMTemplateGenerator(config)
     else:
@@ -51,6 +69,7 @@ def create_app_packager(
         generator,
         resource_builder,
         CompositePostProcessor(post_processors),
+        template_serializer,
         osutils)
 
 
@@ -130,7 +149,7 @@ class SAMTemplateGenerator(TemplateGenerator):
         'Resources': {},
     }
 
-    template_file = "sam.json"
+    template_file = "sam"
 
     def __init__(self, config):
         # type: (Config) -> None
@@ -292,6 +311,7 @@ class SAMTemplateGenerator(TemplateGenerator):
                     },
                 }
             }
+        self._add_domain_name(resource, template)
         self._inject_restapi_outputs(template)
 
     def _inject_restapi_outputs(self, template):
@@ -448,6 +468,7 @@ class SAMTemplateGenerator(TemplateGenerator):
             }
         }
 
+        self._add_websocket_domain_name(resource, template)
         self._inject_websocketapi_outputs(template)
 
     def _inject_websocketapi_outputs(self, template):
@@ -578,6 +599,81 @@ class SAMTemplateGenerator(TemplateGenerator):
             }
         }
 
+    def _generate_apimapping(self, resource, template):
+        # type: (models.APIMapping, Dict[str, Any]) -> None
+        pass
+
+    def _generate_domainname(self, resource, template):
+        # type: (models.DomainName, Dict[str, Any]) -> None
+        pass
+
+    def _add_domain_name(self, resource, template):
+        # type: (models.RestAPI, Dict[str, Any]) -> None
+        if resource.domain_name is None:
+            return
+        domain_name = resource.domain_name
+        endpoint_type = resource.endpoint_type
+        cfn_name = to_cfn_resource_name(domain_name.resource_name)
+        properties = {
+            'DomainName': domain_name.domain_name,
+            'EndpointConfiguration': {
+                'Types': [endpoint_type],
+            }
+        }  # type: Dict[str, Any]
+        if endpoint_type == 'EDGE':
+            properties['CertificateArn'] = domain_name.certificate_arn
+        else:
+            properties['RegionalCertificateArn'] = domain_name.certificate_arn
+        if domain_name.tls_version is not None:
+            properties['SecurityPolicy'] = domain_name.tls_version.value
+        if domain_name.tags:
+            properties['Tags'] = [
+                {'Key': key, 'Value': value}
+                for key, value in sorted(domain_name.tags.items())
+            ]
+        template['Resources'][cfn_name] = {
+            'Type': 'AWS::ApiGateway::DomainName',
+            'Properties': properties
+        }
+        template['Resources'][cfn_name + 'Mapping'] = {
+            'Type': 'AWS::ApiGateway::BasePathMapping',
+            'Properties': {
+                'DomainName': {'Ref': 'ApiGatewayCustomDomain'},
+                'RestApiId': {'Ref': 'RestAPI'},
+                'BasePath': domain_name.api_mapping.mount_path,
+                'Stage': {'Ref': 'RestAPI.Stage'},
+            }
+        }
+
+    def _add_websocket_domain_name(self, resource, template):
+        # type: (models.WebsocketAPI, Dict[str, Any]) -> None
+        if resource.domain_name is None:
+            return
+        domain_name = resource.domain_name
+        cfn_name = to_cfn_resource_name(domain_name.resource_name)
+        properties = {
+            'DomainName': domain_name.domain_name,
+            'DomainNameConfigurations': [
+                {'CertificateArn': domain_name.certificate_arn,
+                 'EndpointType': 'REGIONAL'},
+            ]
+        }
+        if domain_name.tags:
+            properties['Tags'] = domain_name.tags
+        template['Resources'][cfn_name] = {
+            'Type': 'AWS::ApiGatewayV2::DomainName',
+            'Properties': properties,
+        }
+        template['Resources'][cfn_name + 'Mapping'] = {
+            'Type': 'AWS::ApiGatewayV2::ApiMapping',
+            'Properties': {
+                'DomainName': {'Ref': cfn_name},
+                'ApiId': {'Ref': 'WebsocketAPI'},
+                'ApiMappingKey': domain_name.api_mapping.mount_path,
+                'Stage': {'Ref': 'WebsocketAPIStage'},
+            }
+        }
+
     def _register_cfn_resource_name(self, name):
         # type: (str) -> str
         cfn_name = to_cfn_resource_name(name)
@@ -592,7 +688,7 @@ class SAMTemplateGenerator(TemplateGenerator):
 
 class TerraformGenerator(TemplateGenerator):
 
-    template_file = "chalice.tf.json"
+    template_file = "chalice.tf"
 
     def generate(self, resources):
         # type: (List[models.Model]) -> Dict[str, Any]
@@ -893,24 +989,70 @@ class TerraformGenerator(TemplateGenerator):
                         "${aws_api_gateway_rest_api.%s.execution_arn}" % (
                             resource.resource_name) + "/*")
             }
+        self._add_domain_name(resource, template)
+
+    def _add_domain_name(self, resource, template):
+        # type: (models.RestAPI, Dict[str, Any]) -> None
+        if resource.domain_name is None:
+            return
+        domain_name = resource.domain_name
+        endpoint_type = resource.endpoint_type
+        properties = {
+            'domain_name': domain_name.domain_name,
+            'endpoint_configuration': {'types': [endpoint_type]},
+        }
+        if endpoint_type == 'EDGE':
+            properties['certificate_arn'] = domain_name.certificate_arn
+        else:
+            properties[
+                'regional_certificate_arn'] = domain_name.certificate_arn
+        if domain_name.tls_version is not None:
+            properties['security_policy'] = domain_name.tls_version.value
+        if domain_name.tags:
+            properties['tags'] = domain_name.tags
+        template['resource']['aws_api_gateway_domain_name'] = {
+            domain_name.resource_name: properties
+        }
+        template['resource']['aws_api_gateway_base_path_mapping'] = {
+            domain_name.resource_name + '_mapping': {
+                'stage_name': resource.api_gateway_stage,
+                'domain_name': domain_name.domain_name,
+                'api_id': '${aws_api_gateway_rest_api.%s.id}' % (
+                    resource.resource_name)
+            }
+        }
+
+    def _generate_apimapping(self, resource, template):
+        # type: (models.APIMapping, Dict[str, Any]) -> None
+        pass
+
+    def _generate_domainname(self, resource, template):
+        # type: (models.DomainName, Dict[str, Any]) -> None
+        pass
 
 
 class AppPackager(object):
     def __init__(self,
-                 templater,         # type: TemplateGenerator
-                 resource_builder,  # type: ResourceBuilder
-                 post_processor,    # type: TemplatePostProcessor
-                 osutils,           # type: OSUtils
+                 templater,            # type: TemplateGenerator
+                 resource_builder,     # type: ResourceBuilder
+                 post_processor,       # type: TemplatePostProcessor
+                 template_serializer,  # type: TemplateSerializer
+                 osutils,              # type: OSUtils
                  ):
         # type: (...) -> None
         self._templater = templater
         self._resource_builder = resource_builder
         self._template_post_processor = post_processor
+        self._template_serializer = template_serializer
         self._osutils = osutils
 
     def _to_json(self, doc):
         # type: (Any) -> str
         return serialize_to_json(doc)
+
+    def _to_yaml(self, doc):
+        # type: (Any) -> str
+        return yaml.dump(doc, allow_unicode=True)
 
     def package_app(self, config, outdir, chalice_stage_name):
         # type: (Config, str, str) -> None
@@ -923,9 +1065,13 @@ class AppPackager(object):
             self._osutils.makedirs(outdir)
         self._template_post_processor.process(
             template, config, outdir, chalice_stage_name)
+        contents = self._template_serializer.serialize_template(template)
+        extension = self._template_serializer.file_extension
+        filename = os.path.join(
+            outdir, self._templater.template_file) + '.' + extension
         self._osutils.set_file_contents(
-            filename=os.path.join(outdir, self._templater.template_file),
-            contents=self._to_json(template),
+            filename=filename,
+            contents=contents,
             binary=False
         )
 
@@ -977,15 +1123,22 @@ class TerraformCodeLocationPostProcessor(TemplatePostProcessor):
                 asset_path = os.path.join(outdir, 'deployment.zip')
                 self._osutils.copy(r['filename'], asset_path)
                 copied = True
-            r['filename'] = "./deployment.zip"
-            r['source_code_hash'] = '${filebase64sha256("./deployment.zip")}'
+            r['filename'] = "${path.module}/deployment.zip"
+            r['source_code_hash'] = \
+                '${filebase64sha256("${path.module}/deployment.zip")}'
 
 
 class TemplateMergePostProcessor(TemplatePostProcessor):
-    def __init__(self, osutils, merger, merge_template=None):
-        # type: (OSUtils, TemplateMerger, Optional[str]) -> None
+    def __init__(self,
+                 osutils,              # type: OSUtils
+                 merger,               # type: TemplateMerger
+                 template_serializer,  # type: TemplateSerializer
+                 merge_template=None,  # type: Optional[str]
+                 ):
+        # type: (...) -> None
         super(TemplateMergePostProcessor, self).__init__(osutils)
         self._merger = merger
+        self._template_serializer = template_serializer
         self._merge_template = merge_template
 
     def process(self, template, config, outdir, chalice_stage_name):
@@ -1004,11 +1157,8 @@ class TemplateMergePostProcessor(TemplatePostProcessor):
         if not self._osutils.file_exists(filepath):
             raise RuntimeError('Cannot find template file: %s' % filepath)
         template_data = self._osutils.get_file_contents(filepath, binary=False)
-        try:
-            loaded_template = json.loads(template_data)
-        except ValueError:
-            raise RuntimeError(
-                'Expected %s to be valid JSON template.' % filepath)
+        loaded_template = self._template_serializer.load_template(
+            template_data, filepath)
         return loaded_template
 
 
@@ -1047,3 +1197,82 @@ class TemplateDeepMerger(TemplateMerger):
         for key, value in file_template.items():
             merged[key] = self._merge(value, chalice_template.get(key))
         return merged
+
+
+class TemplateSerializer(object):
+
+    file_extension = ''
+
+    def load_template(self, file_contents, filename=''):
+        # type: (str, str) -> Dict[str, Any]
+        pass
+
+    def serialize_template(self, contents):
+        # type: (Dict[str, Any]) -> str
+        pass
+
+
+class JSONTemplateSerializer(TemplateSerializer):
+
+    file_extension = 'json'
+
+    def serialize_template(self, contents):
+        # type: (Dict[str, Any]) -> str
+        return serialize_to_json(contents)
+
+    def load_template(self, file_contents, filename=''):
+        # type: (str, str) -> Dict[str, Any]
+        try:
+            return json.loads(file_contents)
+        except ValueError:
+            raise RuntimeError(
+                'Expected %s to be valid JSON template.' % filename)
+
+
+class YAMLTemplateSerializer(TemplateSerializer):
+
+    file_extension = 'yaml'
+
+    @classmethod
+    def is_yaml_template(cls, template_name):
+        # type: (str) -> bool
+        file_extension = os.path.splitext(template_name)[1].lower()
+        return file_extension in [".yaml", ".yml"]
+
+    def serialize_template(self, contents):
+        # type: (Dict[str, Any]) -> str
+        return yaml.safe_dump(contents, allow_unicode=True)
+
+    def load_template(self, file_contents, filename=''):
+        # type: (str, str) -> Dict[str, Any]
+        yaml.SafeLoader.add_multi_constructor(
+            tag_prefix='!', multi_constructor=self._custom_sam_instrinsics)
+        try:
+            return yaml.load(
+                file_contents,
+                Loader=yaml.SafeLoader,
+            )
+        except ScannerError:
+            raise RuntimeError(
+                'Expected %s to be valid YAML template.' % filename)
+
+    def _custom_sam_instrinsics(self, loader, tag_prefix, node):
+        # type: (yaml.SafeLoader, str, Node) -> Dict[str, Any]
+        tag = node.tag[1:]
+        if tag not in ['Ref', 'Condition']:
+            tag = 'Fn::%s' % tag
+        value = self._get_value(loader, node)
+        return {tag: value}
+
+    def _get_value(self, loader, node):
+        # type: (yaml.SafeLoader, Node) -> Any
+        if node.tag[1:] == 'GetAtt' and isinstance(node.value,
+                                                   six.string_types):
+            value = node.value.split('.', 1)
+        elif isinstance(node, ScalarNode):
+            value = loader.construct_scalar(node)
+        elif isinstance(node, SequenceNode):
+            value = loader.construct_sequence(node)
+        else:
+            value = loader.construct_mapping(node)
+        return value

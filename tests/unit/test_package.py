@@ -80,9 +80,9 @@ def test_terraform_post_processor_moves_files_once():
         'old-dir.zip', os.path.join('outdir', 'deployment.zip'))
     assert mock_osutils.copy.call_count == 1
     assert template['resource']['aws_lambda_function'][
-        'foo']['filename'] == ('./deployment.zip')
+        'foo']['filename'] == ('${path.module}/deployment.zip')
     assert template['resource']['aws_lambda_function'][
-        'bar']['filename'] == ('./deployment.zip')
+        'bar']['filename'] == ('${path.module}/deployment.zip')
 
 
 def test_template_generator_default():
@@ -93,24 +93,14 @@ def test_template_generator_default():
 
 
 class TestTemplateMergePostProcessor(object):
-    def test_can_call_merge(self):
+    def _test_can_call_merge(self, file_template, template_name):
         mock_osutils = mock.Mock(spec=OSUtils)
-        file_template = {
-            "Resources": {
-                "foo": {
-                    "Properties": {
-                        "Environment": {
-                            "Variables": {"Name": "Foo"}
-                        }
-                    }
-                }
-            }
-        }
         mock_osutils.get_file_contents.return_value = json.dumps(file_template)
         mock_merger = mock.Mock(spec=package.TemplateMerger)
         mock_merger.merge.return_value = {}
         p = package.TemplateMergePostProcessor(
-            mock_osutils, mock_merger, merge_template='extras.json')
+            mock_osutils, mock_merger, package.JSONTemplateSerializer(),
+            merge_template=template_name)
         template = {
             'Resources': {
                 'foo': {
@@ -137,6 +127,33 @@ class TestTemplateMergePostProcessor(object):
         assert mock_osutils.get_file_contents.call_count == 1
         mock_merger.merge.assert_called_once_with(file_template, template)
 
+    def test_can_call_merge(self):
+        file_template = {
+            "Resources": {
+                "foo": {
+                    "Properties": {
+                        "Environment": {
+                            "Variables": {"Name": "Foo"}
+                        }
+                    }
+                }
+            }
+        }
+
+        self._test_can_call_merge(file_template, 'extras.json')
+
+    def test_can_call_merge_with_yaml(self):
+        file_template = '''
+            Resources:
+              foo:
+                Properties:
+                  Environment:
+                    Variables:
+                      Name: Foo
+        '''
+
+        self._test_can_call_merge(file_template, 'extras.yaml')
+
     def test_raise_on_bad_json(self):
         mock_osutils = mock.Mock(spec=OSUtils)
         mock_osutils.get_file_contents.return_value = (
@@ -150,7 +167,8 @@ class TestTemplateMergePostProcessor(object):
         )
         mock_merger = mock.Mock(spec=package.TemplateMerger)
         p = package.TemplateMergePostProcessor(
-            mock_osutils, mock_merger, merge_template='extras.json')
+            mock_osutils, mock_merger, package.JSONTemplateSerializer(),
+            merge_template='extras.json')
         template = {}
 
         config = mock.MagicMock(spec=Config)
@@ -165,12 +183,42 @@ class TestTemplateMergePostProcessor(object):
         assert 'to be valid JSON template' in str(e.value)
         assert mock_merger.merge.call_count == 0
 
+    def test_raise_on_bad_yaml(self):
+        mock_osutils = mock.Mock(spec=OSUtils)
+        mock_osutils.get_file_contents.return_value = (
+            '---'
+            'Resources:'
+            '    foo:'
+            '      Properties:'
+            '        Environment:'
+            '          - 123'
+            ''
+        )
+        mock_merger = mock.Mock(spec=package.TemplateMerger)
+        p = package.TemplateMergePostProcessor(
+            mock_osutils, mock_merger, package.YAMLTemplateSerializer(),
+            merge_template='extras.yaml')
+        template = {}
+
+        config = mock.MagicMock(spec=Config)
+        with pytest.raises(RuntimeError) as e:
+            p.process(
+                template,
+                config=config,
+                outdir='outdir',
+                chalice_stage_name='dev',
+            )
+        assert str(e.value).startswith('Expected')
+        assert 'to be valid YAML template' in str(e.value)
+        assert mock_merger.merge.call_count == 0
+
     def test_raise_if_file_does_not_exist(self):
         mock_osutils = mock.Mock(spec=OSUtils)
         mock_osutils.file_exists.return_value = False
         mock_merger = mock.Mock(spec=package.TemplateMerger)
         p = package.TemplateMergePostProcessor(
-            mock_osutils, mock_merger, merge_template='extras.json')
+            mock_osutils, mock_merger, package.JSONTemplateSerializer(),
+            merge_template='extras.json')
         template = {}
 
         config = mock.MagicMock(spec=Config)
@@ -621,6 +669,60 @@ class TestTerraformTemplate(TemplateTestBase):
         assert 'Websocket decorators' in str(excinfo.value)
         # Should mention you can use `chalice deploy`.
         assert 'chalice deploy' in str(excinfo.value)
+
+    def test_can_generate_custom_domain_name(self, sample_app):
+        config = Config.create(
+            chalice_app=sample_app,
+            project_dir='.',
+            api_gateway_stage='api',
+            api_gateway_endpoint_type='EDGE',
+            api_gateway_custom_domain={
+                "certificate_arn": "my_cert_arn",
+                "domain_name": "example.com",
+                "tls_version": "TLS_1_2",
+                "tags": {"foo": "bar"},
+            }
+        )
+        template = self.generate_template(config, 'dev')
+        assert template['resource']['aws_api_gateway_domain_name'][
+            'api_gateway_custom_domain'] == {
+                'domain_name': 'example.com',
+                'certificate_arn': 'my_cert_arn',
+                'security_policy': 'TLS_1_2',
+                'endpoint_configuration': {'types': ['EDGE']},
+                'tags': {'foo': 'bar'},
+        }
+        assert template['resource']['aws_api_gateway_base_path_mapping'][
+            'api_gateway_custom_domain_mapping'] == {
+                'api_id': '${aws_api_gateway_rest_api.rest_api.id}',
+                'stage_name': 'api',
+                'domain_name': 'example.com',
+        }
+
+    def test_can_generate_domain_for_regional_endpoint(self, sample_app):
+        config = Config.create(
+            chalice_app=sample_app,
+            project_dir='.',
+            api_gateway_stage='api',
+            api_gateway_endpoint_type='REGIONAL',
+            api_gateway_custom_domain={
+                "certificate_arn": "my_cert_arn",
+                "domain_name": "example.com",
+            }
+        )
+        template = self.generate_template(config, 'dev')
+        assert template['resource']['aws_api_gateway_domain_name'][
+            'api_gateway_custom_domain'] == {
+                'domain_name': 'example.com',
+                'regional_certificate_arn': 'my_cert_arn',
+                'endpoint_configuration': {'types': ['REGIONAL']},
+        }
+        assert template['resource']['aws_api_gateway_base_path_mapping'][
+            'api_gateway_custom_domain_mapping'] == {
+                'api_id': '${aws_api_gateway_rest_api.rest_api.id}',
+                'stage_name': 'api',
+                'domain_name': 'example.com',
+        }
 
 
 class TestSAMTemplate(TemplateTestBase):
@@ -1212,6 +1314,121 @@ class TestSAMTemplate(TemplateTestBase):
             }
         }
 
+    def test_can_generate_custom_domain_name(self, sample_app):
+        config = Config.create(
+            chalice_app=sample_app,
+            project_dir='.',
+            api_gateway_stage='api',
+            api_gateway_endpoint_type='EDGE',
+            api_gateway_custom_domain={
+                "certificate_arn": "my_cert_arn",
+                "domain_name": "example.com",
+                "tls_version": "TLS_1_2",
+                "tags": {"foo": "bar", "bar": "baz"},
+            }
+        )
+        template = self.generate_template(config, 'dev')
+        domain = template['Resources']['ApiGatewayCustomDomain']
+        mapping = template['Resources']['ApiGatewayCustomDomainMapping']
+        assert domain == {
+            'Type': 'AWS::ApiGateway::DomainName',
+            'Properties': {
+                'CertificateArn': 'my_cert_arn',
+                'DomainName': 'example.com',
+                'SecurityPolicy': 'TLS_1_2',
+                'EndpointConfiguration': {
+                    'Types': ['EDGE']
+                },
+                'Tags': [
+                    {'Key': 'bar',
+                     'Value': 'baz'},
+                    {'Key': 'foo',
+                     'Value': 'bar'}
+                ]
+            }
+        }
+        assert mapping == {
+            'Type': 'AWS::ApiGateway::BasePathMapping',
+            'Properties': {
+                'DomainName': {'Ref': 'ApiGatewayCustomDomain'},
+                'RestApiId': {'Ref': 'RestAPI'},
+                'Stage': {'Ref': 'RestAPI.Stage'},
+                'BasePath': '(none)',
+            }
+        }
+
+    def test_can_generate_domain_for_regional_endpoint(self, sample_app):
+        config = Config.create(
+            chalice_app=sample_app,
+            project_dir='.',
+            api_gateway_stage='api',
+            api_gateway_endpoint_type='REGIONAL',
+            api_gateway_custom_domain={
+                "certificate_arn": "my_cert_arn",
+                "domain_name": "example.com",
+            }
+        )
+        template = self.generate_template(config, 'dev')
+        domain = template['Resources']['ApiGatewayCustomDomain']
+        mapping = template['Resources']['ApiGatewayCustomDomainMapping']
+        assert domain == {
+            'Type': 'AWS::ApiGateway::DomainName',
+            'Properties': {
+                'RegionalCertificateArn': 'my_cert_arn',
+                'DomainName': 'example.com',
+                'EndpointConfiguration': {
+                    'Types': ['REGIONAL']
+                }
+            }
+        }
+        assert mapping == {
+            'Type': 'AWS::ApiGateway::BasePathMapping',
+            'Properties': {
+                'DomainName': {'Ref': 'ApiGatewayCustomDomain'},
+                'RestApiId': {'Ref': 'RestAPI'},
+                'Stage': {'Ref': 'RestAPI.Stage'},
+                'BasePath': '(none)',
+            }
+        }
+
+    def test_can_generate_domain_for_ws_endpoint(self, sample_websocket_app):
+        config = Config.create(
+            chalice_app=sample_websocket_app,
+            project_dir='.',
+            api_gateway_stage='api',
+            websocket_api_custom_domain={
+                "certificate_arn": "my_cert_arn",
+                "domain_name": "example.com",
+                'tags': {'foo': 'bar', 'bar': 'baz'},
+            }
+        )
+        template = self.generate_template(config, 'dev')
+        domain = template['Resources']['WebsocketApiCustomDomain']
+        mapping = template['Resources']['WebsocketApiCustomDomainMapping']
+        assert domain == {
+            'Type': 'AWS::ApiGatewayV2::DomainName',
+            'Properties': {
+                'DomainName': 'example.com',
+                'DomainNameConfigurations': [
+                    {'CertificateArn': 'my_cert_arn',
+                     'EndpointType': 'REGIONAL'},
+                ],
+                'Tags': {
+                    'foo': 'bar',
+                    'bar': 'baz'
+                },
+            }
+        }
+        assert mapping == {
+            'Type': 'AWS::ApiGatewayV2::ApiMapping',
+            'Properties': {
+                'DomainName': {'Ref': 'WebsocketApiCustomDomain'},
+                'ApiId': {'Ref': 'WebsocketAPI'},
+                'Stage': {'Ref': 'WebsocketAPIStage'},
+                'ApiMappingKey': '(none)',
+            }
+        }
+
 
 class TestTemplateDeepMerger(object):
     def test_can_merge_without_changing_identity(self):
@@ -1333,3 +1550,42 @@ class TestTemplateDeepMerger(object):
         assert result == {
             'key': 'foo'
         }
+
+
+@pytest.mark.parametrize('filename,is_yaml', [
+    ('extras.yaml', True),
+    ('extras.YAML', True),
+    ('extras.yml', True),
+    ('extras.YML', True),
+    ('extras.foo.yml', True),
+    ('extras', False),
+    ('extras.json', False),
+    ('extras.yaml.json', False),
+    ('foo/bar/extras.yaml', True),
+    ('foo/bar/extras.YAML', True),
+])
+def test_to_cfn_resource_name(filename, is_yaml):
+    assert package.YAMLTemplateSerializer.is_yaml_template(filename) == is_yaml
+
+
+@pytest.mark.parametrize('yaml_contents,expected', [
+    ('foo: bar', {'foo': 'bar'}),
+    ('foo: !Ref bar', {'foo': {'Ref': 'bar'}}),
+    ('foo: !GetAtt Bar.Baz', {'foo': {'Fn::GetAtt': ['Bar', 'Baz']}}),
+    ('foo: !FooBar [!Baz YetAnother, "hello"]',
+     {'foo': {'Fn::FooBar': [{'Fn::Baz': 'YetAnother'}, 'hello']}}),
+    ('foo: !SomeTag {"a": "1"}', {'foo': {'Fn::SomeTag': {'a': '1'}}}),
+    ('foo: !GetAtt Foo.Bar.Baz', {'foo': {'Fn::GetAtt': ['Foo', 'Bar.Baz']}}),
+    ('foo: !Condition Other', {'foo': {'Condition': 'Other'}}),
+    ('foo: !GetAtt ["a", "b"]', {'foo': {'Fn::GetAtt': ['a', 'b']}}),
+])
+def test_supports_custom_tags(yaml_contents, expected):
+    serialize = package.YAMLTemplateSerializer()
+    actual = serialize.load_template(yaml_contents)
+    assert actual == expected
+    # Also verify we can serialize then parse them back to what we originally
+    # loaded.  Note that this is not the same thing as round tripping as
+    # we convert things like '!Ref foo' over to {'Ref': 'foo'}.
+    yaml_str = serialize.serialize_template(actual).strip()
+    reparsed = serialize.load_template(yaml_str)
+    assert actual == reparsed
