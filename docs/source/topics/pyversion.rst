@@ -37,7 +37,7 @@ In the example above, we're using python 3.6.1 so chalice automatically
 selects the ``python3.6`` runtime for lambda.  If we were using python 2.7.11,
 chalice would automatically select ``python2.7`` as the runtime.
 
-Since AWS Lambda does not support python 3.3.x, 3.4.x or 3.5.x, chalice would
+Since AWS Lambda does not support python 3.3.x, 3.4.x or 3.5.x, Chalice would
 automatically select ``python3.6`` as the closest.
 
 Chalice will emit a warning if the minor version does not match a python
